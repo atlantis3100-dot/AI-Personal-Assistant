@@ -27,7 +27,8 @@ def get_sheet(sheet_id):
 
 # --- [概要：智慧大腦 - 判斷訊息分類的代碼（省 Token 版）] ---
 def ai_classify(content, is_image=False):
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # 修正：將大腦型號正確對接到 2.5 版本
+    model = genai.GenerativeModel('gemini-2.5-flash')
     prompt = "你是專業秘書。請分析以下內容應歸類為：'BUSINESS'(公務)、'PRIVATE'(私人)、'CARD'(名片)或'MEMORY'(記憶)。只需回傳大寫代碼。"
     if is_image:
         response = model.generate_content([prompt, content])
@@ -51,12 +52,10 @@ def handle_text(event):
     msg_id = event.message.id
     user_msg = event.message.text
     
-    # 判斷是否有手動標籤
     if user_msg.startswith("公:"): category = "BUSINESS"; clean_msg = user_msg[2:]
     elif user_msg.startswith("私:"): category = "PRIVATE"; clean_msg = user_msg[2:]
     elif user_msg.startswith("名片:"): category = "CARD"; clean_msg = user_msg[3:]
     else:
-        # 沒標籤？交給 AI 判斷 (原則 5)
         category = ai_classify(user_msg)
         clean_msg = user_msg
 
@@ -69,12 +68,11 @@ def handle_image(event):
     img_data = io.BytesIO(message_content.content)
     img_b = {"mime_type": "image/jpeg", "data": img_data.getvalue()}
     
-    # AI 辨識圖片性質 (原則 2: 分析完不儲存)
     category = ai_classify(img_b, is_image=True)
     
-    # 如果是名片，進行 OCR 辨識
     if category == "CARD":
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # 修正：將大腦型號正確對接到 2.5 版本
+        model = genai.GenerativeModel('gemini-2.5-flash')
         res = model.generate_content(["請讀取這張名片，整理成：姓名、電話、公司。單行輸出。", img_b])
         clean_msg = res.text
     else:
@@ -97,7 +95,6 @@ def save_to_sheet(event, category, clean_msg, msg_id):
         if not sheet.get_all_values():
             sheet.append_row(["時間", "內容", "訊息ID"])
             
-        # 防重複檢查 (原則 5)
         if msg_id in sheet.col_values(3): return
         
         sheet.append_row([datetime.now().strftime('%Y-%m-%d %H:%M'), clean_msg, msg_id])
