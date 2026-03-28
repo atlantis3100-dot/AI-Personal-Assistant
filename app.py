@@ -1,91 +1,29 @@
 import os
-import time
-import re
 import json
-import hashlib
 import gspread
+from datetime import datetime
 from flask import Flask, request, abort
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage, FileMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import google.generativeai as genai
 
 app = Flask(__name__)
 
-# --- 資安強化：金鑰鎖入環境變數 (符合原則 3) ---
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
-# Google Sheets Credentials JSON 字符串存於環境變數中
-GOOGLE_SHEETS_CREDS_JSON = os.environ.get('GOOGLE_SHEETS_CREDS_JSON')
+# --- [概要：從 Render 讀取環境變數的代碼] ---
+line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
+handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
+genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# --- [概要：設定 Google API 存取權限的代碼] ---
+def get_sheet(sheet_id):
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/contacts']
+    creds_json = json.loads(os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+    client = gspread.authorize(creds)
+    return client.open_by_key(sheet_id).get_worksheet(0)
 
-# --- 資料庫配置 (雙 Sheets 分流) ---
-# 這些名稱需要與老闆建立的實體 Sheets 一致
-BRAIN_DB_NAME = "助理大腦資料庫"
-WORK_DB_NAME = "公務作業中心"
-
-#正規表達式：護照格式 (英文字母+8位數字)
-PASSPORT_REGEX = re.compile(r'[A-Z][0-9]{8}')
-
-# --- Google Sheets 授權 (記憶不失憶核心) ---
-def get_sheets_client():
-    creds_dict = json.loads(GOOGLE_SHEETS_CREDS_JSON)
-    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    return gspread.authorize(creds)
-
-# --- 完善步驟：隱私指紋化 & 查重 (Hashing) ---
-def generate_fingerprint(text):
-    """產生不可逆的 SHA-256 指紋。"""
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
-
-def check_duplicate_and_save_work(passport_id):
-    """(私有) 比對指紋防重複，兼顧功能與隱私。"""
-    sheets_client = get_sheets_client()
-    sh = sheets_client.open(BRAIN_DB_NAME)
-    # 分頁 4: 隱私指紋表
-    ws_fingerprint = sh.worksheet("隱私指紋表")
-    
-    fingerprint = generate_fingerprint(passport_id)
-    existing_fingerprints = ws_fingerprint.col_values(1) # 假設指紋在第一欄
-
-    if fingerprint in existing_fingerprints:
-        return True # 重複了
-    
-    # 若不重複，記錄指紋 (不存原碼)
-    ws_fingerprint.append_row([fingerprint, time.strftime("%Y-%m-%d %H:%M:%S")])
-    return False
-
-# --- 完善步驟：關鍵字遮罩與記憶儲存 ---
-def mask_sensitive_info(text):
-    """將護照號碼替換為遮罩文字。"""
-    return PASSPORT_REGEX.sub("[敏感資訊已遮蔽]", text)
-
-def save_chat_history(user_id, role, content):
-    """將對話紀錄存入 Sheets (分頁 1: 對話紀錄)。"""
-    # 執行遮罩
-    safe_content = mask_sensitive_info(content)
-    
-    sheets_client = get_sheets_client()
-    sh = sheets_client.open(BRAIN_DB_NAME)
-    ws_history = sh.worksheet("對話紀錄")
-    
-    # 只存 50 句邏輯需要在 Sheets 端手動維護或另寫清理代碼，
-    # 這邊先實作簡單寫入，以不失憶為優先。
-    ws_history.append_row([user_id, role, safe_content, time.strftime("%Y-%m-%d %H:%M:%S")])
-
-# --- 完善步驟：模擬真人延遲 (Anti-Bot) ---
-def simulate_human_delay():
-    """原則 5：模擬真人行為，隨機延遲 1-3 秒。"""
-    import random
-    time.sleep(random.uniform(1.0, 3.0))
-
-# ---身分鎖 ---
-MY_UID = 'U89456930d66887538a7c645b0a3bebd4'
-
-# --- Webhook 主程序 ---
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -96,48 +34,57 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- 文字訊息處理 (含遮罩、記憶、查重、增欄詢問概念) ---
 @handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    simulate_human_delay() # 模擬延遲
-    
-    user_id = event.source.user_id
-    user_message = event.message.text
-    
-    # 身分鎖檢查
-    if user_id != MY_UID:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="[偽裝] 哈哈，你好，期待為您服務！"))
-        return
+def handle_message(event):
+    # --- [概要：防重複機制：記錄 LINE 訊息 ID 的代碼] ---
+    msg_id = event.message.id
+    user_msg = event.message.text
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # 保存老闆的訊息 (已遮罩)
-    save_chat_history(user_id, "user", user_message)
-
-    # 查重邏輯實測 (假設老闆傳來護照號碼)
-    passport_match = PASSPORT_REGEX.search(user_message)
-    if passport_match:
-        passport_id = passport_match.group(0)
-        is_duplicate = check_duplicate_and_save_work(passport_id)
-        
-        if is_duplicate:
-            response_text = f"老闆，這本護照 ({mask_sensitive_info(passport_id)}) 之前辨識過了喔！"
+    # --- [概要：四向分流邏輯判斷的代碼] ---
+    try:
+        if user_msg.startswith("公:"):
+            target_id = os.environ.get('ID_BUSINESS')
+            clean_msg = user_msg[2:]
+            category = "公務"
+        elif user_msg.startswith("私:"):
+            target_id = os.environ.get('ID_PRIVATE')
+            clean_msg = user_msg[2:]
+            category = "私人"
+        elif user_msg.startswith("名片:"):
+            target_id = os.environ.get('ID_CARD')
+            clean_msg = user_msg[3:]
+            category = "名片"
+            # 這裡預留 Google People API 同步邏輯
         else:
-            response_text = f"收到，護照 ({mask_sensitive_info(passport_id)}) 指紋已記錄，防重複偵測已啟動。"
-            # 這邊之後要縫合「寫入公務作業中心」的邏輯
-    
-    # 動態增欄詢問概念 (模擬情境)
-    elif "統編" in user_message and "增加欄位" not in user_message:
-         response_text = "老闆，偵測到訊息含有『統編』，需要幫您在支出試算表自動增加一欄嗎？"
+            target_id = os.environ.get('ID_MEMORY')
+            clean_msg = user_msg
+            category = "記憶"
 
-    else:
-        response_text = "收到老闆指令！大腦與 Sheets 記憶連線正常。"
+        sheet = get_sheet(target_id)
+        
+        # --- [概要：自動建立表頭邏輯（若表為空）的代碼] ---
+        if not sheet.get_all_values():
+            sheet.append_row(["時間", "內容", "訊息ID", "分類"])
 
-    # 保存並回應助理的訊息 (已遮罩)
-    save_chat_history(user_id, "assistant", response_text)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response_text))
+        # --- [概要：檢查是否重複輸入的代碼] ---
+        existing_ids = sheet.col_values(3)
+        if msg_id in existing_ids:
+            return # 已存在則不執行
 
-@app.route("/", methods=['GET'])
-def index():
-    return "AI特助永久雲端屋 - 連線正常"
+        # --- [概要：單次任務：將資料寫入試算表的代碼] ---
+        sheet.append_row([now, clean_msg, msg_id, category])
+        
+        # --- [概要：調用 Gemini 2.5 進行極簡回覆（省 Token）的代碼] ---
+        model = genai.GenerativeModel('gemini-1.5-flash') # 使用 Flash 以節省費用
+        response = model.generate_content(f"請簡短回覆老闆這則{category}紀錄已完成：{clean_msg}")
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response.text))
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="助理暫時失聯，請檢查試算表 ID 或共用權限。"))
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
