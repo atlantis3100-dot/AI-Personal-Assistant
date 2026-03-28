@@ -13,17 +13,18 @@ import google.generativeai as genai
 
 app = Flask(__name__)
 
-# --- [概要：初始化 LINE 與 Gemini API] ---
+# --- [初始化 LINE 與 Gemini API] ---
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 
-# --- [概要：讀取助理人格設定] ---
+# --- [時區與人格設定] ---
+TW_TZ = pytz.timezone('Asia/Taipei')
 try:
     with open('persona.txt', 'r', encoding='utf-8') as f:
         PERSONA_SETUP = f.read().strip()
 except:
-    PERSONA_SETUP = "你是一位30歲專業男性特助，老闆是 A.J。語氣溫暖俐落，像朋友般幽默。"
+    PERSONA_SETUP = "你是一位30歲專業男性特助，老闆是 A.J。相處像朋友，俐落溫暖且帶幽默感。嚴禁Markdown。"
 
 def get_sheet(sheet_id):
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -32,33 +33,45 @@ def get_sheet(sheet_id):
     client = gspread.authorize(creds)
     return client.open_by_key(sheet_id).get_worksheet(0)
 
-# --- [概要：動態對齊表頭的 AI 核心邏輯] ---
-def ai_dynamic_parse(content, headers, is_image=False):
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    header_str = "、".join(headers)
-    prompt = f"""你是一位專業助理。請分析提供的內容，並將資訊對應到以下表頭欄位：[{header_str}]。
-    請嚴格回傳一個 JSON 陣列，順序必須與表頭完全一致。找不到的填"無"。
-    如果是記帳，請自動拆分品項與金額。如果資訊超出表頭定義，請整理在最後一個欄位。
-    不要包含任何 markdown 標記，直接回傳 JSON 陣列。"""
-    
-    if is_image:
-        res = model.generate_content([prompt, content])
-    else:
-        res = model.generate_content(f"{prompt}\n內容：{content}")
-    
+# --- [關鍵功能：抓取最後 50 行對話記憶] ---
+def get_chat_history():
     try:
-        clean_txt = res.text.strip().replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_txt)
+        sheet = get_sheet(os.environ.get('ID_MEMORY'))
+        values = sheet.get_all_values()
+        if len(values) > 1:
+            # 抓取最後 50 筆，僅保留時間與內容
+            history = values[-50:]
+            formatted_history = "\n".join([f"{row[0]}: {row[1]}" for row in history])
+            return formatted_history
     except:
-        return [res.text] + ["無"] * (len(headers) - 1)
+        return "尚無過去對話紀錄。"
+    return ""
 
-def generate_human_reply(details):
-    model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=PERSONA_SETUP)
-    prompt = f"老闆 A.J 傳了：{details}。請用你的人設回覆他。嚴禁 Markdown，要口語自然。"
-    try:
-        return model.generate_content(prompt).text.strip()
-    except:
-        return f"A.J，幫你記好了！"
+# --- [核心邏輯：AI 動態對齊與對話生成] ---
+def ai_brain_process(category, content, headers=None, is_image=False):
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    history = get_chat_history()
+    
+    # 根據分類切換不同指令
+    if category == "MEMORY":
+        # 閒聊模式：帶入 50 行記憶與人格設定
+        prompt = f"系統設定：{PERSONA_SETUP}\n\n過去 50 筆紀錄：\n{history}\n\n老闆 A.J 剛才說：{content}\n請以特助身份自然回覆。不要 Markdown。"
+        res = model.generate_content(prompt)
+        return res.text.strip(), None
+    else:
+        # 資料處理模式：動態對齊表頭
+        header_str = "、".join(headers) if headers else "內容"
+        prompt = f"分析內容並對應到表頭：[{header_str}]。回傳 JSON 陣列，順序一致。找不到填'無'。不准有 Markdown 標記。"
+        if is_image:
+            res = model.generate_content([prompt, content])
+        else:
+            res = model.generate_content(f"{prompt}\n內容：{content}")
+        
+        try:
+            clean_txt = res.text.strip().replace('```json', '').replace('```', '').strip()
+            return f"A.J，{category} 資料我處理好了。", json.loads(clean_txt)
+        except:
+            return f"A.J，這筆資料我先幫你記在最後了。", [res.text] + ["無"] * (len(headers)-1)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -71,69 +84,44 @@ def callback():
     return 'OK'
 
 @handler.add(MessageEvent, message=(TextMessage, ImageMessage))
-def handle_any_message(event):
-    # --- [概要：統一處理邏輯，包含時區校正] ---
-    tz = pytz.timezone('Asia/Taipei')
-    now_str = datetime.now(tz).strftime('%Y-%m-%d %H:%M')
+def handle_message(event):
+    now_str = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
+    is_img = event.message.type == "image"
     
-    if event.message.type == "text":
-        user_msg = event.message.text
-        # 初步判斷分類
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        cat_res = model.generate_content(f"將此內容分類為 BUSINESS, PRIVATE, CARD, 或 MEMORY。只需回傳代碼：{user_msg}")
-        category = cat_res.text.strip()
-        content_to_parse = user_msg
-    else:
-        # 處理圖片
+    if is_img:
         msg_content = line_bot_api.get_message_content(event.message.id)
-        img_data = io.BytesIO(msg_content.content)
-        img_b = {"mime_type": "image/jpeg", "data": img_data.getvalue()}
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        cat_res = model.generate_content(["判斷圖片分類：BUSINESS, PRIVATE, CARD, MEMORY。只回傳代碼。", img_b])
-        category = cat_res.text.strip()
-        content_to_parse = img_b
+        content_input = {"mime_type": "image/jpeg", "data": io.BytesIO(msg_content.content).getvalue()}
+    else:
+        content_input = event.message.text
 
-    save_dynamic(event, category, content_to_parse, now_str)
+    # 1. 快速分類 (2.5 API)
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    cat_prompt = f"將內容分類為 BUSINESS, PRIVATE, CARD, MEMORY。只回傳代碼：{content_input if not is_img else '[圖片]'}"
+    category = model.generate_content(cat_prompt).text.strip()
 
-def save_dynamic(event, category, content, time_str):
-    id_map = {
-        "BUSINESS": os.environ.get('ID_BUSINESS'),
-        "PRIVATE": os.environ.get('ID_PRIVATE'),
-        "CARD": os.environ.get('ID_CARD'),
-        "MEMORY": os.environ.get('ID_MEMORY')
-    }
+    # 2. 獲取目標表頭並處理
+    id_map = {"BUSINESS": os.environ.get('ID_BUSINESS'), "PRIVATE": os.environ.get('ID_PRIVATE'), 
+              "CARD": os.environ.get('ID_CARD'), "MEMORY": os.environ.get('ID_MEMORY')}
     target_id = id_map.get(category, os.environ.get('ID_MEMORY'))
     
     try:
         sheet = get_sheet(target_id)
-        headers = sheet.row_values(1)
+        headers = sheet.row_values(1) or ["時間", "內容", "訊息ID"]
         
-        # 如果表是空的，建立預設表頭
-        if not headers:
-            headers = ["時間", "內容", "訊息ID"]
-            sheet.append_row(headers)
+        # 3. AI 處理：回覆文字與分欄數據
+        reply_text, parsed_row = ai_brain_process(category, content_input, headers[1:-1], is_img)
         
-        # 呼叫 AI 依照表頭分欄
-        is_img = isinstance(content, dict)
-        parsed_data = ai_dynamic_parse(content, headers[1:-1], is_image=is_img) # 扣掉時間跟 ID
-        
-        final_row = [time_str] + parsed_data + [event.message.id]
-        
-        # 防重複
-        ids = sheet.col_values(len(headers))
-        if event.message.id in ids: return
-        
-        sheet.append_row(final_row)
-        
-        # 回覆邏輯
-        if category == "MEMORY":
-            reply = generate_human_reply(str(content) if not is_img else "[圖片]")
+        # 4. 寫入資料
+        if category == "MEMORY" and not parsed_row:
+            final_row = [now_str, content_input if not is_img else "[圖片]", event.message.id]
         else:
-            reply = f"A.J，{category} 資料已依照你的表頭分類存好囉！"
+            final_row = [now_str] + parsed_row + [event.message.id]
+            
+        sheet.append_row(final_row)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
     except Exception as e:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"A.J，寫入有點卡住：{str(e)}"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"A.J，我這出了點狀況：{str(e)}"))
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
