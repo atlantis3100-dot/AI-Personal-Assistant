@@ -80,7 +80,7 @@ def handle_image(event):
 
     save_to_sheet(event, category, clean_msg, event.message.id)
 
-# --- [概要：統一寫入試算表與防重複的代碼] ---
+# --- [概要：統一寫入試算表與防重複的代碼 (加入例外捕捉，將真實錯誤訊息傳回 LINE)] ---
 def save_to_sheet(event, category, clean_msg, msg_id):
     id_map = {
         "BUSINESS": os.environ.get('ID_BUSINESS'),
@@ -99,8 +99,9 @@ def save_to_sheet(event, category, clean_msg, msg_id):
         
         sheet.append_row([datetime.now().strftime('%Y-%m-%d %H:%M'), clean_msg, msg_id])
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已自動歸類至【{category}】\n內容：{clean_msg}"))
-    except:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 寫入失敗，請檢查 ID 與權限。"))
+    except Exception as e:
+        # 這裡會把真正的錯誤原因抓出來，直接傳給您的 LINE
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 系統錯誤回報：{str(e)}"))
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
