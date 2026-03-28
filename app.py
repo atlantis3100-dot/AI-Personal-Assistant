@@ -17,7 +17,6 @@ line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 
-# --- [概要：Google 試算表連線邏輯的代碼] ---
 def get_sheet(sheet_id):
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds_json = json.loads(os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
@@ -25,11 +24,9 @@ def get_sheet(sheet_id):
     client = gspread.authorize(creds)
     return client.open_by_key(sheet_id).get_worksheet(0)
 
-# --- [概要：智慧大腦 - 判斷訊息分類的代碼（省 Token 版）] ---
 def ai_classify(content, is_image=False):
-    # 修正：將大腦型號正確對接到 2.5 版本
     model = genai.GenerativeModel('gemini-2.5-flash')
-    prompt = "你是專業秘書。請分析以下內容應歸類為：'BUSINESS'(公務)、'PRIVATE'(私人)、'CARD'(名片)或'MEMORY'(記憶)。只需回傳大寫代碼。"
+    prompt = "你是專業秘書。請分析以下內容應歸類為：'BUSINESS'(公務)、'PRIVATE'(私人記帳)、'CARD'(名片)或'MEMORY'(閒聊)。只需回傳大寫代碼。"
     if is_image:
         response = model.generate_content([prompt, content])
     else:
@@ -46,7 +43,6 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- [概要：處理文字訊息（自動分類）的代碼] ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     msg_id = event.message.id
@@ -61,7 +57,7 @@ def handle_text(event):
 
     save_to_sheet(event, category, clean_msg, msg_id)
 
-# --- [概要：處理圖片訊息（視覺辨識）的代碼] ---
+# --- [概要：處理圖片訊息，強制 Gemini 2.5 切割欄位的代碼] ---
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
     message_content = line_bot_api.get_message_content(event.message.id)
@@ -71,17 +67,26 @@ def handle_image(event):
     category = ai_classify(img_b, is_image=True)
     
     if category == "CARD":
-        # 修正：將大腦型號正確對接到 2.5 版本
         model = genai.GenerativeModel('gemini-2.5-flash')
-        res = model.generate_content(["請讀取這張名片，整理成：姓名、電話、公司。單行輸出。", img_b])
-        clean_msg = res.text
+        # 修正：要求嚴格輸出 JSON 陣列，不准擠成一坨
+        prompt = """請讀取這張名片，嚴格回傳一個 JSON 陣列格式，不要包含 ```json 等 markdown 標記。
+        格式必須完全依照此順序：["姓名", "手機號碼", "公司電話", "公司名稱", "職稱與服務項目"]。
+        如果找不到某項目，請填 "無" """
+        res = model.generate_content([prompt, img_b])
+        
+        try:
+            # 清理 AI 可能夾帶的標記並轉換為 List
+            clean_txt = res.text.strip().replace('```json', '').replace('```', '').strip()
+            clean_msg = json.loads(clean_txt)
+        except:
+            clean_msg = ["解析失敗", "無", "無", "無", res.text]
     else:
         clean_msg = "[圖片內容]"
 
     save_to_sheet(event, category, clean_msg, event.message.id)
 
-# --- [概要：統一寫入試算表與防重複的代碼 (加入例外捕捉，將真實錯誤訊息傳回 LINE)] ---
-def save_to_sheet(event, category, clean_msg, msg_id):
+# --- [概要：統一寫入試算表，並針對「名片庫」進行七格切分的代碼] ---
+def save_to_sheet(event, category, content, msg_id):
     id_map = {
         "BUSINESS": os.environ.get('ID_BUSINESS'),
         "PRIVATE": os.environ.get('ID_PRIVATE'),
@@ -92,15 +97,34 @@ def save_to_sheet(event, category, clean_msg, msg_id):
     
     try:
         sheet = get_sheet(target_id)
-        if not sheet.get_all_values():
-            sheet.append_row(["時間", "內容", "訊息ID"])
-            
-        if msg_id in sheet.col_values(3): return
+        records = sheet.get_all_values()
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M')
         
-        sheet.append_row([datetime.now().strftime('%Y-%m-%d %H:%M'), clean_msg, msg_id])
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已自動歸類至【{category}】\n內容：{clean_msg}"))
+        # 如果是名片，且 content 是 List (陣列)
+        if category == "CARD" and isinstance(content, list):
+            if not records:
+                # 自動建立專業名片庫表頭
+                sheet.append_row(["時間", "姓名", "手機號碼", "公司電話", "公司名稱", "職稱與服務項目", "訊息ID"])
+                records = sheet.get_all_values()
+                
+            row_data = [time_str] + content + [msg_id]
+            reply_text = f"✅ 已精準分欄存入【名片庫】\n姓名：{content[0]}\n公司：{content[3]}"
+            
+        else:
+            if not records:
+                sheet.append_row(["時間", "內容", "訊息ID"])
+                records = sheet.get_all_values()
+                
+            row_data = [time_str, str(content), msg_id]
+            reply_text = f"✅ 已自動歸類至【{category}】\n內容：{content}"
+            
+        # 防重複檢查 (比對最後一欄的訊息ID)
+        if records and msg_id in [row[-1] for row in records]: return
+        
+        sheet.append_row(row_data)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        
     except Exception as e:
-        # 這裡會把真正的錯誤原因抓出來，直接傳給您的 LINE
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 系統錯誤回報：{str(e)}"))
 
 if __name__ == "__main__":
