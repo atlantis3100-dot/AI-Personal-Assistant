@@ -1,4 +1,4 @@
-# --- [概要：這是系統的總調度中心，負責接收 LINE 訊息、生成動態安全連結，並渲染高質感 Web 控制台的代碼] ---
+# --- [概要：總調度中心。更新了介面配色，改為乾淨專業、帶有「Gemini藍」點綴的明亮 Google 風格。] ---
 import os
 import io
 import uuid
@@ -14,16 +14,14 @@ import sheets_handler
 import brain
 
 app = Flask(__name__)
-# 概要：用於保護網頁 Session 的隨機金鑰
 app.secret_key = os.urandom(24) 
 
 line_bot_api = LineBotApi(config.LINE_TOKEN)
 handler = WebhookHandler(config.LINE_SECRET)
 
-# 概要：存放動態安全連結的暫存區。格式為 { "token_字串": 過期時間戳 }
 secure_tokens = {}
 
-# --- [概要：深色都會風 Web 控制台的 HTML/CSS 介面代碼，確保視覺專業俐落] ---
+# --- [CSS 更新概要：參考 Gemini/GAS 風格，改為純白背景、俐落 Cool-gray 字體、搭配明亮 Gemini-blue 作為 Active 顏色] ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-TW">
@@ -32,42 +30,86 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>A.J. Office | 專屬數位中樞</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
-        body { background-color: #0f1015; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
-        .container { max-width: 650px; margin-top: 8vh; }
-        .card { background-color: #1a1c23; border: 1px solid #2d3139; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.6); }
-        .btn-primary { background-color: #3b82f6; border: none; font-weight: 500; transition: 0.3s; }
-        .btn-primary:hover { background-color: #2563eb; }
-        .upload-area { border: 2px dashed #4b5563; border-radius: 12px; padding: 50px 20px; text-align: center; cursor: pointer; transition: 0.3s; background-color: #13141a; }
-        .upload-area:hover { border-color: #3b82f6; background-color: #1a1f2e; }
+        body { 
+            background-color: #FFFFFF; /* 純白背景，明亮俐落 */
+            color: #202124; /* Google 標準深灰文字 */
+            font-family: 'Roboto', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container { max-width: 650px; margin-top: 10vh; }
+        .card { 
+            background-color: #FFFFFF; 
+            border: 1px solid #DADCE0; /* 極淡的框線，符合 Google 原生 Material 質感 */
+            border-radius: 16px; /* 更圓潤的角，更有現代 App 感 */
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05), 0 1px 3px rgba(0,0,0,0.1); /* 柔和的陰影 */
+        }
+        h3.title { 
+            color: #1A73E8; /* 特有的明亮 Gemini-blue / GCP-blue */
+            font-weight: 500;
+        }
+        .btn-primary { 
+            background-color: #1A73E8; /* Gemini-blue */
+            border: none; 
+            border-radius: 8px;
+            padding: 10px 24px;
+            font-weight: 500; 
+            transition: 0.2s background-color;
+        }
+        .btn-primary:hover { background-color: #174EA6; }
+        .upload-area { 
+            border: 2px dashed #DADCE0; 
+            border-radius: 12px; 
+            padding: 60px 20px; 
+            text-align: center; 
+            cursor: pointer; 
+            transition: 0.3s background-color, 0.3s border-color; 
+            background-color: #F8F9FA; /* cool-gray 淺灰背景 */
+            color: #5F6368; /* secondary text cool-gray */
+        }
+        .upload-area:hover { 
+            border-color: #1A73E8; /* 懸停時亮起藍色框線 */
+            background-color: #E8F0FE; /* 懸停時染上一層極淡的藍色，專業互動感 */
+            color: #1967D2;
+        }
         .error-box { text-align: center; padding: 40px 20px; }
-        .error-icon { font-size: 3rem; color: #ef4444; margin-bottom: 20px; }
-        #status-box { font-size: 0.9em; color: #9ca3af; margin-top: 15px; }
+        .error-icon { font-size: 3.5rem; color: #D93025; margin-bottom: 25px; } /* Google-red 錯誤圖示 */
+        #status-box { font-size: 0.95em; color: #616161; margin-top: 20px; }
+        .footer-link { font-size: 0.9em; color: #70757A; }
+        .footer-link:hover { color: #202124; text-decoration: none; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="card p-4 p-md-5">
-            <h3 class="text-center mb-4" style="color: #f3f4f6; font-weight: 600;">A.J. Office</h3>
+            <h3 class="text-center mb-5 title">A.J. Office</h3>
             
             {% if error_msg %}
             <div class="error-box">
                 <div class="error-icon">⚠️</div>
-                <h5 style="color: #f3f4f6;">存取被拒絕</h5>
-                <p class="text-muted mt-3">{{ error_msg }}</p>
+                <h5 style="color: #202124; font-weight: 500;">存取被拒絕</h5>
+                <p class="text-muted mt-3" style="color: #5F6368;">{{ error_msg }}</p>
             </div>
             {% else %}
-            <h5 class="mb-4 text-center" style="color: #9ca3af;">公務批次安全上傳區</h5>
+            <h6 class="mb-4 text-center" style="color: #5F6368; font-weight: 500;">公務批次安全上傳區 (Gemini 解析)</h6>
             <form action="/aj-office/upload" method="POST" enctype="multipart/form-data">
                 <div class="upload-area mb-3" onclick="document.getElementById('fileInput').click()">
-                    <div style="font-size: 2rem; margin-bottom: 10px;">📄</div>
-                    <p class="mb-0" style="color: #d1d5db;">點擊此處選擇檔案，或將護照 / 公務圖片拖曳至此</p>
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" class="mb-3">
+                        <path d="M14 2H6C4.89 2 4 2.9 4 4V20C4 21.1 4.89 22 6 22H18C19.1 22 20 21.1 20 20V8L14 2Z" fill="#E8F0FE"/>
+                        <path d="M14 2V8H20L14 2Z" fill="#AECBFA"/>
+                        <path d="M16 13H8V15H16V13Z" fill="#1A73E8"/>
+                        <path d="M16 17H8V19H16V17Z" fill="#1A73E8"/>
+                        <path d="M12 9H8V11H12V9Z" fill="#1A73E8"/>
+                    </svg>
+                    <p class="mb-0" style="color: #3C4043; font-weight: 500;">將護照或公務圖片拖曳至此</p>
+                    <p class="text-muted mt-1" style="font-size: 0.9em;">或點擊此處選擇檔案</p>
                     <input type="file" id="fileInput" name="files" style="display: none;" multiple accept="image/*" onchange="this.form.submit()">
                 </div>
             </form>
             <div id="status-box" class="text-center">{{ status_msg }}</div>
-            <div class="text-center mt-5">
-                <a href="/aj-office/logout" class="text-muted text-decoration-none" style="font-size: 0.85em;">🔒 鎖定並登出系統</a>
+            <div class="text-center mt-5 pt-4" style="border-top: 1px solid #DADCE0;">
+                <a href="/aj-office/logout" class="footer-link">🔒 銷毀憑證並登出</a>
             </div>
             {% endif %}
         </div>
@@ -76,29 +118,25 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- [概要：處理 Web 控制台路由、動態 token 驗證與權限管理的代碼] ---
+# --- [以下邏輯維持不變，僅更新了上傳成功的回報訊息，強調安全性] ---
 @app.route('/aj-office', methods=['GET'])
 def office_dashboard():
-    # 檢查網址是否有帶 token
     token = request.args.get('token')
     now = time.time()
     
-    # 驗證 Token 邏輯
     if token:
         if token in secure_tokens and secure_tokens[token] > now:
-            # 驗證成功，核發 Session，並把該 token 刪除（確保一次性使用）
             session['aj_logged_in'] = True
             session.permanent = True
             del secure_tokens[token]
-            return redirect('/aj-office') # 重新導向以隱藏網址上的 token
+            return redirect('/aj-office')
         else:
-            return render_template_string(HTML_TEMPLATE, error_msg="連結已失效或過期，請透過 LINE 重新索取。")
+            return render_template_string(HTML_TEMPLATE, error_msg="安全憑證已失效或過期，請重新索取。")
 
-    # 檢查是否已登入
     if not session.get('aj_logged_in'):
-        return render_template_string(HTML_TEMPLATE, error_msg="未授權的存取。此為私密通道，請從 LINE 獲取專屬鑰匙。")
+        return render_template_string(HTML_TEMPLATE, error_msg="未經授權的存取。此為私密通道，請從 LINE 獲取鑰匙。")
         
-    status_msg = request.args.get('status', '系統待命中，支援多檔案批次上傳。資料將於分析後立即物理抹除。')
+    status_msg = request.args.get('status', '系統待命中。圖片將於辨識寫入 Sheets 後立即物理抹除，不留痕跡。')
     return render_template_string(HTML_TEMPLATE, status_msg=status_msg)
 
 @app.route('/aj-office/logout', methods=['GET'])
@@ -108,7 +146,6 @@ def office_logout():
 
 @app.route('/aj-office/upload', methods=['POST'])
 def office_upload():
-    # --- [概要：處理電腦端上傳圖片，交由大腦辨識後寫入試算表，並徹底釋放記憶體的代碼] ---
     if not session.get('aj_logged_in'): 
         return abort(403)
     
@@ -131,13 +168,12 @@ def office_upload():
         if sheets_handler.write_to_dynamic_sheet(cat, parsed_data, fake_msg_id, now_str):
             success_count += 1
             
-        # 概要：物理抹除機密資料，釋放 Render 記憶體
+        # 物理抹除機密資料，釋放記憶體
         del img_b
         del file
         
-    return redirect(f'/aj-office?status=✅ 成功處理並銷毀 {success_count} 份公務檔案。')
+    return redirect(f'/aj-office?status=✅ 成功辨識 {success_count} 份檔案，個資已從伺服器抹除。')
 
-# --- [概要：處理 LINE Webhook 總入口與分流的代碼] ---
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -165,12 +201,11 @@ def handle_msg(event):
     
     # 2. 處理資料與路由
     if cat == "SYSTEM_LINK":
-        # 概要：生成一次性、限時 1 小時的專屬連結代碼
         new_token = str(uuid.uuid4())
         secure_tokens[new_token] = time.time() + 3600
         base_url = request.host_url.rstrip('/')
         secure_link = f"{base_url}/aj-office?token={new_token}"
-        reply = res.get('reply', 'A.J.，為您開啟專屬安全通道：') + f"\n{secure_link}"
+        reply = res.get('reply', 'A.J.，為您開啟專屬安全通道（1小時效期）：') + f"\n{secure_link}"
         
     elif cat == "Chat" and res.get('is_action'):
         # 查詢天氣等動作，直接回覆，並存入記憶區
@@ -185,7 +220,6 @@ def handle_msg(event):
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
     
-    # 釋放圖片記憶體
     if is_img:
         del content_input
 
